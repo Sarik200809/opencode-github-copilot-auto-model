@@ -1,15 +1,16 @@
 # opencode-github-copilot-auto-model
 
-Adds `github-copilot/auto` to opencode and can also inject additional configured
-Copilot auto models. True Copilot auto-session routing is currently known to work
-for the Claude and GPT/Codex families. Other listed Copilot models, such as
-Gemini, are best-effort and may fall back to configured model selection rather
-than full Copilot auto-session behavior.
+Adds `github-copilot/auto` to opencode, plus per-family autos: by default the
+plugin also injects **`Auto Claude`** and **`Auto GPT`** when those families are
+available in your Copilot catalog. True Copilot auto-session routing is currently
+known to work for the Claude and GPT/Codex families. Other listed Copilot models,
+such as Gemini, are best-effort and may fall back to configured model selection
+rather than full Copilot auto-session behavior.
 
 GitHub Copilot's `auto` ID isn't accepted by the chat API directly; "auto" is a
 client-side concept backed by two server endpoints. This plugin drives them from
-opencode and adds the model to the picker as **`Auto`** plus any configured
-extra autos such as **`Auto Claude`** or **`Auto GPT/Codex`**.
+opencode and adds the models to the picker as **`Auto`** plus the default
+per-family autos (or any configured autos, which replace the defaults).
 
 > **What the UI shows:** the picker and status bar read **`Auto`** (static label;
 > the per-turn routing decision is surfaced as a transient toast — e.g.
@@ -57,6 +58,9 @@ always runs regardless):
         "noReasoning": ["gpt-5.3-codex", "claude-sonnet-4.6"],
 
         // Additional picker autos, all from this one plugin instance.
+        // When omitted, the plugin injects one default auto per supported family
+        // (Auto Claude, Auto GPT) that has at least two catalog models.
+        // Set [] to disable the defaults; an explicit list replaces them.
         // `name` and `id` are optional; the plugin derives them when omitted.
         "autos": [
           {
@@ -85,12 +89,15 @@ Options summary:
 | `preferredModels` | string[] | Ordered fallback list; first pool match sets the anchor and default model. |
 | `reasoning` | string[] | Preferred model(s) when the intent router returns `needs_reasoning`. |
 | `noReasoning` | string[] | Preferred model(s) when the intent router returns `no_reasoning`. |
-| `autos` | object[] | Additional injected autos from the same plugin instance. Each entry can set `id`, `name`, `preferredModels`, `reasoning`, and `noReasoning`. |
+| `autos` | object[] | Additional injected autos from the same plugin instance. Each entry can set `id`, `name`, `preferredModels`, `reasoning`, and `noReasoning`. Defaults to one auto per supported family (Claude, GPT) with at least two catalog models; `[]` disables the defaults. |
 
 `autos` lets you expose multiple family-scoped Copilot autos from one plugin entry,
 for example a Claude auto and a GPT auto at the same time. Repeating the same npm
 plugin entry in `opencode.json` is not required. Treat Claude and GPT/Codex as the
 primary supported families; Gemini and other non-session families are limited.
+When `autos` is not set, `Auto Claude` and `Auto GPT` are injected automatically
+(each clamped to its own family); Gemini stays opt-in because its best-effort
+fallback needs configured preferences.
 
 > **On cross-family preferences (e.g. claude-sonnet-4.6 for reasoning, gpt-5.3-codex
 > for noReasoning):** the routing label is independent of model family — the intent
@@ -199,7 +206,20 @@ override the model ID sent to that endpoint, not the endpoint itself. This means
 
 ### Multiple autos from one plugin entry
 
-Use `autos` to inject additional picker models from the same plugin instance:
+By default (no `autos` key), the plugin injects one auto per supported family in
+addition to the legacy `Auto`:
+
+- `Auto Claude` (`auto-claude`) when at least two Claude models are in the catalog.
+- `Auto GPT` (`auto-gpt`) when at least two GPT/Codex models are in the catalog.
+
+Each default auto is clamped to its family: pool defaults and router candidates
+from other families are ignored, even when they share the same transport endpoint
+(GPT and Gemini can both ride `@ai-sdk/github-copilot`). If a clamped auto's family
+disappears from the session pool, the request falls back to the catalog anchor and
+is sent without `Copilot-Session-Token` (same best-effort semantics as Gemini).
+
+To disable the defaults, set `"autos": []`. To customize, configure `autos`
+explicitly (an explicit list replaces the defaults):
 
 ```jsonc
 {
@@ -230,7 +250,8 @@ Use `autos` to inject additional picker models from the same plugin instance:
 Notes:
 
 - The legacy top-level options still define the original `Auto` picker model.
-- Each `autos[]` entry gets its own session token cache and sticky router state.
+- Each auto (default or configured) gets its own session token cache and sticky
+  router state.
 - `id` and `name` are optional. When omitted, the plugin derives them from the
   anchored family where possible, for example `Auto Claude` / `auto-claude`.
 - A configured auto is only useful when its preferred models share the same real
