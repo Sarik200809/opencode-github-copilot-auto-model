@@ -41,6 +41,13 @@ const codex = makeModel(
   "https://api.githubcopilot.com",
   "GPT-5.3 Codex",
 )
+const gpt54 = makeModel(
+  "gpt-5.4",
+  "gpt-5.4",
+  "@ai-sdk/github-copilot",
+  "https://api.githubcopilot.com",
+  "GPT-5.4",
+)
 const haiku = makeModel(
   "claude-haiku-4.5",
   "claude-haiku-4-5-20251001",
@@ -671,6 +678,175 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models.auto.name).toBe("Auto")
     expect(models["auto-2"]).toBeDefined()
     expect(models["auto-2"].name).toBe("Auto 2")
+  })
+
+  test("injects default family autos when autos is not configured", async () => {
+    const models = await callHook({
+      "claude-sonnet-4.6": sonnet,
+      "claude-haiku-4.5": haiku,
+      "gpt-5.3-codex": codex,
+      "gpt-5.4": gpt54,
+    })
+    expect(models.auto.name).toBe("Auto")
+    expect(models["auto-claude"].name).toBe("Auto Claude")
+    expect(models["auto-claude"].api.npm).toBe("@ai-sdk/anthropic")
+    expect(models["auto-gpt"].name).toBe("Auto GPT")
+    expect(models["auto-gpt"].api.npm).toBe("@ai-sdk/github-copilot")
+  })
+
+  test("autos: [] disables the default family autos", async () => {
+    const models = await callHook(
+      {
+        "claude-sonnet-4.6": sonnet,
+        "claude-haiku-4.5": haiku,
+        "gpt-5.3-codex": codex,
+        "gpt-5.4": gpt54,
+      },
+      { autos: [] },
+    )
+    expect(models.auto).toBeDefined()
+    expect(models["auto-claude"]).toBeUndefined()
+    expect(models["auto-gpt"]).toBeUndefined()
+  })
+
+  test("explicit autos replace the default family autos", async () => {
+    const models = await callHook(
+      {
+        "claude-sonnet-4.6": sonnet,
+        "claude-haiku-4.5": haiku,
+        "gpt-5.3-codex": codex,
+        "gpt-5.4": gpt54,
+      },
+      { autos: [{ name: "Auto GPT/Codex", preferredModels: ["gpt-5.3-codex"] }] },
+    )
+    expect(models["auto-gpt-codex"]).toBeDefined()
+    expect(models["auto-claude"]).toBeUndefined()
+    expect(models["auto-gpt"]).toBeUndefined()
+  })
+
+  test("skips default auto for a family with fewer than two models", async () => {
+    const models = await callHook({
+      "claude-sonnet-4.6": sonnet,
+      "gpt-5.3-codex": codex,
+      "gpt-5.4": gpt54,
+    })
+    expect(models["auto-gpt"]).toBeDefined()
+    expect(models["auto-claude"]).toBeUndefined()
+  })
+
+  test("does not inject a default gemini auto", async () => {
+    const models = await callHook({
+      "claude-sonnet-4.6": sonnet,
+      "claude-haiku-4.5": haiku,
+      "gemini-3.1-pro": geminiPro,
+      "gemini-3.5-flash": geminiFlash,
+    })
+    expect(models["auto-claude"]).toBeDefined()
+    expect(models["auto-gemini"]).toBeUndefined()
+  })
+
+  test("default claude auto routes within the claude family", async () => {
+    const { output } = await callChatParamsWithRouting(
+      {
+        "claude-sonnet-4.6": sonnet,
+        "claude-haiku-4.5": haiku,
+        "gpt-5.3-codex": codex,
+        "gpt-5.4": gpt54,
+      },
+      {},
+      "ses_default_claude",
+      {
+        predicted_label: "no_reasoning",
+        candidate_models: ["gpt-5.4", "gpt-5.3-codex", "claude-haiku-4-5-20251001", "claude-sonnet-4-6-20250929"],
+        confidence: 0.9,
+      },
+      "auto-claude",
+    )
+    // Cross-family candidates are filtered out; the top claude candidate wins.
+    expect(output.options.model).toBe("claude-haiku-4-5-20251001")
+  })
+
+  test("default gpt auto routes within the gpt family", async () => {
+    const { output } = await callChatParamsWithRouting(
+      {
+        "claude-sonnet-4.6": sonnet,
+        "claude-haiku-4.5": haiku,
+        "gpt-5.3-codex": codex,
+        "gpt-5.4": gpt54,
+      },
+      {},
+      "ses_default_gpt",
+      {
+        predicted_label: "no_reasoning",
+        candidate_models: ["claude-haiku-4-5-20251001", "gpt-5.4", "gpt-5.3-codex"],
+        confidence: 0.9,
+      },
+      "auto-gpt",
+    )
+    expect(output.options.model).toBe("gpt-5.4")
+  })
+
+  test("default family auto omits session token when its family is missing from the pool", async () => {
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+      const u = url.toString()
+      if (u.includes("/models/session/intent"))
+        return new Response(
+          JSON.stringify({ predicted_label: "no_reasoning", candidate_models: ["gpt-5.4"], confidence: 0.9 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )
+      if (u.includes("/models/session"))
+        return new Response(
+          JSON.stringify({
+            session_token: "test-session-token",
+            selected_model: "gpt-5.4",
+            available_models: ["gpt-5.4", "gpt-5.3-codex"],
+            expires_at: Math.floor(Date.now() / 1000) + 3600,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )
+      return origFetch(url, _init)
+    }) as unknown as typeof fetch
+
+    try {
+      const hooks = await plugin.server(
+        { client: { tui: { showToast: async () => undefined } } } as never,
+        {},
+      )
+      const resolved = await hooks.provider!.models!(
+        {
+          id: "github-copilot",
+          models: {
+            "claude-sonnet-4.6": sonnet,
+            "claude-haiku-4.5": haiku,
+            "gpt-5.3-codex": codex,
+            "gpt-5.4": gpt54,
+          },
+        } as never,
+        oauth,
+      )
+      await hooks["chat.message"]!(
+        { sessionID: "ses_default_missing_family" } as never,
+        { parts: [{ type: "text", text: "test prompt" }] } as never,
+      )
+      const context = {
+        sessionID: "ses_default_missing_family",
+        agent: "build",
+        model: resolved["auto-claude"],
+        provider: { source: "config" as const, info: {} as never, options: {} },
+        message: {} as never,
+      }
+      const paramsOutput = makeOutput()
+      await hooks["chat.params"]!(context, paramsOutput)
+      const headersOutput = makeOutput()
+      await hooks["chat.headers"]!(context, headersOutput)
+
+      // Claude vanished from the pool: fall back to the catalog anchor, without the token.
+      expect(paramsOutput.options.model).toBe("claude-sonnet-4-6-20250929")
+      expect(headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
+    } finally {
+      globalThis.fetch = origFetch
+    }
   })
 })
 
