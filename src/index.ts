@@ -83,6 +83,9 @@ type Options = {
   noReasoning?: string[]
   // Additional injected autos. Each one anchors independently based on its own
   // preferred model list and keeps its own routing/session cache.
+  // When omitted, the plugin injects one default auto per supported family
+  // (Claude, GPT) that has at least two catalog models. Pass [] to disable the
+  // defaults, or an explicit list to replace them.
   autos?: AutoConfig[]
 }
 
@@ -94,6 +97,10 @@ type AutoDraft = {
   noReasoning: string[]
   legacy: boolean
   index: number
+  // Clamp this auto to one family label (e.g. "Claude"). Used by the default
+  // per-family autos so they never drift to another family that happens to share
+  // the same transport endpoint (e.g. GPT and Gemini both ride @ai-sdk/github-copilot).
+  familyFilter?: string
 }
 
 type TemplateAPI = {
@@ -114,10 +121,13 @@ type InjectedAuto = {
   template?: Model
   templateApi?: TemplateAPI
   catalogDefaultModelID?: string
+  familyFilter?: string
 }
 
-function pickTemplate(models: Record<string, Model>) {
-  return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
+function pickTemplate(models: Record<string, Model>, familyFilter?: string) {
+  return Object.values(models).find(
+    (m) => m.providerID === PROVIDER_ID && (!familyFilter || familyLabel(m) === familyFilter),
+  )
 }
 
 function templateAPI(model: Model): TemplateAPI {
@@ -149,7 +159,37 @@ function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string
   return resolved
 }
 
-function autoDrafts(options: Options): AutoDraft[] {
+// Families injected as per-family autos when `autos` is not configured. Claude and
+// GPT/Codex are the two families with true Copilot auto-session support; Gemini and
+// others stay opt-in because their best-effort path needs configured preferences.
+const DEFAULT_AUTO_FAMILIES = ["Claude", "GPT"]
+
+// One default auto per supported family that has at least two catalog models
+// (the within-family router needs a strong + fast tier to choose between).
+function defaultFamilyDrafts(models: Record<string, Model>): AutoDraft[] {
+  const counts = new Map<string, number>()
+  for (const model of Object.values(models)) {
+    if (model.providerID !== PROVIDER_ID) continue
+    const label = familyLabel(model)
+    if (!label) continue
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  const drafts: AutoDraft[] = []
+  for (const [index, label] of DEFAULT_AUTO_FAMILIES.entries()) {
+    if ((counts.get(label) ?? 0) < 2) continue
+    drafts.push({
+      preferredModels: [],
+      reasoning: [],
+      noReasoning: [],
+      legacy: false,
+      index: index + 1,
+      familyFilter: label,
+    })
+  }
+  return drafts
+}
+
+function autoDrafts(options: Options, models: Record<string, Model>): AutoDraft[] {
   const drafts: AutoDraft[] = [
     {
       requestedID: MODEL_ID,
@@ -161,7 +201,13 @@ function autoDrafts(options: Options): AutoDraft[] {
       index: 0,
     },
   ]
-  for (const [index, auto] of (options.autos ?? []).entries()) {
+  if (options.autos === undefined) {
+    // Default: inject one auto per supported family. `autos: []` opts out and an
+    // explicit list replaces the defaults entirely.
+    drafts.push(...defaultFamilyDrafts(models))
+    return drafts
+  }
+  for (const [index, auto] of options.autos.entries()) {
     drafts.push({
       requestedID: auto.id?.trim() || undefined,
       requestedName: auto.name?.trim() || undefined,
@@ -196,17 +242,17 @@ function uniqueValue(base: string, used: Set<string>, suffix = "-"): string {
 function familyLabel(model?: Model): string | undefined {
   if (!model) return undefined
   const fingerprint = `${model.id} ${model.name} ${model.family} ${model.api.id}`.toLowerCase()
-  if (model.api.npm === "@ai-sdk/anthropic" || fingerprint.includes("claude")) return "Claude"
-  if (model.api.npm === "@ai-sdk/google" || fingerprint.includes("gemini")) return "Gemini"
-  if (
-    model.api.npm === "@ai-sdk/github-copilot" ||
-    model.api.npm === "@ai-sdk/openai" ||
-    fingerprint.includes("gpt") ||
-    fingerprint.includes("codex")
-  )
-    return "GPT"
+  // Fingerprint checks first: on the github-copilot provider many families share the
+  // same transport npm (e.g. GPT, Gemini and MAI can all ride @ai-sdk/github-copilot),
+  // so the npm package alone cannot distinguish them.
+  if (fingerprint.includes("claude")) return "Claude"
+  if (fingerprint.includes("gemini")) return "Gemini"
   if (fingerprint.includes("microsoft") || fingerprint.includes("mai") || fingerprint.includes("raptor"))
     return "Microsoft"
+  if (fingerprint.includes("gpt") || fingerprint.includes("codex")) return "GPT"
+  if (model.api.npm === "@ai-sdk/anthropic") return "Claude"
+  if (model.api.npm === "@ai-sdk/google") return "Gemini"
+  if (model.api.npm === "@ai-sdk/github-copilot" || model.api.npm === "@ai-sdk/openai") return "GPT"
   if (model.family?.trim()) {
     return model.family
       .split(/[^a-zA-Z0-9]+/)
@@ -497,7 +543,6 @@ function withAutoModels(models: Record<string, Model>, autos: InjectedAuto[]) {
 
 const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   const opts = (options ?? {}) as Options
-  const drafts = autoDrafts(opts)
   const conversations = new Map<string, Map<string, ConvState>>()
   let injectedAutos: InjectedAuto[] = []
   let injectedAutoByID = new Map<string, InjectedAuto>()
@@ -583,20 +628,37 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
 
       const conv = getConv(incoming.sessionID, auto.id)
       const session = await ensureSession(incoming.sessionID, auto.id) // refresh token on the turn
+      // Family-clamped autos only ever see pool entries / candidates of their own label
+      // family. Endpoint checks alone are not enough: GPT and Gemini can share the same
+      // transport (npm + url) on the github-copilot provider.
+      const matchesFamily = (apiId: string | undefined) => {
+        if (!auto.familyFilter) return true
+        if (!apiId) return false
+        const model = modelByApiId(apiId)
+        return !!model && familyLabel(model) === auto.familyFilter
+      }
+      const pool = (session?.availableModels ?? []).filter((id) => matchesFamily(id))
       // Default to the first same-family model in the pool (VS Code's _selectDefaultModel),
       // not the undocumented selected_model — kept only as a hint behind it. Everything here
       // is clamped to the cloned endpoint's family (catalogDefaultModelID / templateApi.id
       // always are; the session's selected pick may drift to another family).
       let decided =
-        preferredPoolModel(session?.availableModels ?? [], auto.preferredApiIDs, auto.templateApi) ??
-        defaultPoolModel(session?.availableModels ?? [], auto.templateApi) ??
-        (isSameFamily(session?.selectedModelID, auto.templateApi) ? session?.selectedModelID : undefined) ??
+        preferredPoolModel(pool, auto.preferredApiIDs, auto.templateApi) ??
+        defaultPoolModel(pool, auto.templateApi) ??
+        (isSameFamily(session?.selectedModelID, auto.templateApi) && matchesFamily(session?.selectedModelID)
+          ? session?.selectedModelID
+          : undefined) ??
         auto.catalogDefaultModelID ??
         auto.templateApi?.id
       const prompt = conv.lastPrompt
       const sessionMissingConfiguredPrefs =
         !!session && auto.preferredApiIDs.length > 0 && !auto.preferredApiIDs.some((id) => session.availableModels.includes(id))
-      if (sessionMissingConfiguredPrefs && auto.catalogDefaultModelID) {
+      // A family-clamped auto whose family vanished from the session pool must not send
+      // its model with the session token (the server rejects out-of-pool models).
+      const sessionLacksFamilyModels =
+        !!session && !!auto.familyFilter && session.availableModels.length > 0 && pool.length === 0
+      const poolExcludesAuto = sessionMissingConfiguredPrefs || sessionLacksFamilyModels
+      if (poolExcludesAuto && auto.catalogDefaultModelID) {
         conv.omitSessionToken = true
         if (conv.routedModelID !== undefined && !conv.needsReEval) {
           // Sticky: reuse the first turn's pick so the model — and its prompt KV cache —
@@ -639,7 +701,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
         conv.omitSessionToken = false
       }
 
-      if (session?.sessionToken && prompt && autoBearer && auto.templateApi && !sessionMissingConfiguredPrefs) {
+      if (session?.sessionToken && prompt && autoBearer && auto.templateApi && !poolExcludesAuto) {
         if (!session.availableModels.length) {
           log("intent skipped: session returned no available_models")
         } else if (conv.routedModelID !== undefined && !conv.needsReEval) {
@@ -663,7 +725,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
             session.availableModels,
             context,
           )
-          const candidates = decision?.candidate_models ?? []
+          const candidates = (decision?.candidate_models ?? []).filter((candidate) => matchesFamily(candidate))
           if (candidates.length) {
             // Use label-specific preferences when available; fall back to general list.
             const label = decision?.predicted_label
@@ -726,6 +788,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       async models(provider, ctx) {
         autoKnownModels = Object.values(provider.models)
         autoBearer = ctx.auth?.type === "oauth" ? ctx.auth.refresh : undefined
+        const drafts = autoDrafts(opts, provider.models)
         const sessionCache = new Map<string, Promise<AutoSession | undefined>>()
         const usedIDs = new Set<string>([...Object.keys(provider.models), MODEL_ID])
         const usedNames = new Set<string>(["Auto"])
@@ -735,7 +798,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
           const preferredApiIDs = resolvePreferredApiIDs(provider.models, draft.preferredModels)
           const reasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.reasoning)
           const noReasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.noReasoning)
-          let template = pickTemplate(provider.models)
+          let template = pickTemplate(provider.models, draft.familyFilter)
           const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
           if (preferredTemplate) {
             template = preferredTemplate
@@ -762,12 +825,26 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
                   log(`preference session pick${draft.legacy ? "" : ` (${draft.requestedName ?? draft.requestedID ?? draft.index})`} -> ${preferredModel.api.id}`)
                 }
               } else if (!preferredTemplate) {
-                template = modelByApiId(session.selectedModelID) ?? template
+                // Family-clamped autos anchor on the first pool model of their family
+                // (VS Code's _selectDefaultModel, within the family); the unclamped
+                // legacy auto follows the session's selected model.
+                const sessionPick = draft.familyFilter
+                  ? session.availableModels
+                      .map(modelByApiId)
+                      .find((model) => model && familyLabel(model) === draft.familyFilter)
+                  : modelByApiId(session.selectedModelID)
+                template = sessionPick ?? template
               }
               // Guard: if the selected model's family has no fast/strong pair in the pool,
               // the within-family router can't do anything — anchor on a family that does
-              // (still a genuine Copilot auto model from the pool).
-              if (!preferredTemplate && !preferredInPool && poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2) {
+              // (still a genuine Copilot auto model from the pool). Never re-anchor a
+              // family-clamped auto: staying in its family is the whole point.
+              if (
+                !draft.familyFilter &&
+                !preferredTemplate &&
+                !preferredInPool &&
+                poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2
+              ) {
                 const richer = session.availableModels
                   .map(modelByApiId)
                   .find((model) => model && poolFamilyCount(model.api.npm, model.api.url, session.availableModels) >= 2)
@@ -795,6 +872,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
             template,
             templateApi: template ? templateAPI(template) : undefined,
             catalogDefaultModelID: template?.api.id,
+            familyFilter: draft.familyFilter,
           })
         }
 
